@@ -89,46 +89,114 @@ def find_xml_text(root, tag_name):
     return None
 
 
+def initialize_anyconnect_auth(vpn_url, auth_group=None, ignore_tls_errors=False):
+    parsed = urllib.parse.urlparse(
+        vpn_url if "://" in vpn_url else f"https://{vpn_url}"
+    )
+    target_url = urllib.parse.urlunparse(parsed._replace(fragment=""))
+    request = urllib.request.Request(
+        target_url,
+        data=build_anyconnect_init_payload(target_url, auth_group),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    ssl_context = None
+    if ignore_tls_errors:
+        ssl_context = ssl._create_unverified_context()
+
+    try:
+        with urllib.request.urlopen(
+            request, timeout=60, context=ssl_context
+        ) as response:
+            response_root = ET.fromstring(response.read())
+    except Exception as exc:
+        raise RuntimeError(
+            f"AnyConnect authentication initialization failed for {target_url}: {exc}"
+        ) from exc
+
+    sso_login = find_xml_text(response_root, "sso-v2-login")
+    if not sso_login:
+        raise RuntimeError(
+            "AnyConnect authentication response did not contain sso-v2-login"
+        )
+
+    return {
+        "target_url": target_url,
+        "saml_url": urllib.parse.urljoin(target_url, sso_login),
+        "tunnel_group": find_xml_text(response_root, "tunnel-group") or "",
+        "aggauth_handle": find_xml_text(response_root, "aggauth-handle") or "",
+        "config_hash": find_xml_text(response_root, "config-hash") or "",
+        "token_cookie_name": find_xml_text(
+            response_root, "sso-v2-token-cookie-name"
+        ),
+    }
+
+
 def build_saml_url(
     vpn_url, protocol, provider, auth_group=None, ignore_tls_errors=False
 ):
     parsed = urllib.parse.urlparse(
         vpn_url if "://" in vpn_url else f"https://{vpn_url}"
     )
-    target_url = urllib.parse.urlunparse(parsed._replace(fragment=""))
-
     if protocol == "anyconnect":
-        request = urllib.request.Request(
-            target_url,
-            data=build_anyconnect_init_payload(target_url, auth_group),
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            method="POST",
-        )
-        ssl_context = None
-        if ignore_tls_errors:
-            ssl_context = ssl._create_unverified_context()
-
-        try:
-            with urllib.request.urlopen(
-                request, timeout=60, context=ssl_context
-            ) as response:
-                response_root = ET.fromstring(response.read())
-        except Exception as exc:
-            raise RuntimeError(
-                f"AnyConnect authentication initialization failed: {exc}"
-            ) from exc
-
-        sso_login = find_xml_text(response_root, "sso-v2-login")
-        if not sso_login:
-            raise RuntimeError(
-                "AnyConnect authentication response did not contain sso-v2-login"
-            )
-        return urllib.parse.urljoin(target_url, sso_login)
+        return initialize_anyconnect_auth(
+            vpn_url, auth_group, ignore_tls_errors
+        )["saml_url"]
 
     base = f"{parsed.scheme}://{parsed.netloc}"
     saml_paths = provider.get("saml_paths", {})
     path = saml_paths.get(protocol, saml_paths.get("anyconnect", "/"))
     return f"{base}{path}"
+
+
+def build_anyconnect_confirmation_payload(auth_init, sso_token):
+    root = ET.Element(
+        "config-auth",
+        {"client": "vpn", "type": "auth-reply", "aggregate-auth-version": "2"},
+    )
+    version = ET.SubElement(root, "version", {"who": "vpn"})
+    version.text = ANYCONNECT_VERSION
+    ET.SubElement(root, "device-id").text = "linux-64"
+    ET.SubElement(root, "session-token")
+    ET.SubElement(root, "session-id")
+    opaque = ET.SubElement(root, "opaque", {"is-for": "sg"})
+    ET.SubElement(opaque, "tunnel-group").text = auth_init["tunnel_group"]
+    ET.SubElement(opaque, "aggauth-handle").text = auth_init["aggauth_handle"]
+    ET.SubElement(opaque, "auth-method").text = "single-sign-on-v2"
+    ET.SubElement(opaque, "config-hash").text = auth_init["config_hash"]
+    auth = ET.SubElement(root, "auth")
+    ET.SubElement(auth, "sso-token").text = sso_token
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+
+def confirm_anyconnect_auth(auth_init, sso_token, ignore_tls_errors=False):
+    request = urllib.request.Request(
+        auth_init["target_url"],
+        data=build_anyconnect_confirmation_payload(auth_init, sso_token),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    ssl_context = None
+    if ignore_tls_errors:
+        ssl_context = ssl._create_unverified_context()
+
+    try:
+        with urllib.request.urlopen(
+            request, timeout=60, context=ssl_context
+        ) as response:
+            response_root = ET.fromstring(response.read())
+    except Exception as exc:
+        raise RuntimeError(
+            f"AnyConnect authentication confirmation failed: {exc}"
+        ) from exc
+
+    session_token = find_xml_text(response_root, "session-token")
+    server_cert_hash = find_xml_text(response_root, "server-cert-hash")
+    if not session_token:
+        raise RuntimeError(
+            "AnyConnect authentication confirmation did not return a session-token"
+        )
+    return session_token, server_cert_hash
 
 
 def find_field(page, field_cfg):
@@ -305,6 +373,16 @@ def get_auth_timeout(provider):
     return int(configured_timeout)
 
 
+def authentication_complete(anyconnect_auth, saml_result, vpn_cookies):
+    if anyconnect_auth and anyconnect_auth.get("token_cookie_name"):
+        return bool(saml_result.get("sso_token"))
+    return bool(
+        saml_result.get("saml_response")
+        or saml_result.get("prelogin_cookie")
+        or vpn_cookies
+    )
+
+
 def run_auth():
     vpn_url = os.environ.get("VPN_URL")
     vpn_user = os.environ.get("VPN_USER")
@@ -329,16 +407,30 @@ def run_auth():
     vpn_host = parsed.hostname or vpn_url
 
     ignore_tls = os.environ.get("AUTH_IGNORE_TLS_ERRORS", "0") == "1"
-    saml_url = build_saml_url(
-        vpn_url, protocol, provider, auth_group, ignore_tls_errors=ignore_tls
-    )
+    anyconnect_auth = None
+    if protocol == "anyconnect":
+        anyconnect_auth = initialize_anyconnect_auth(
+            vpn_url, auth_group, ignore_tls_errors=ignore_tls
+        )
+        saml_url = anyconnect_auth["saml_url"]
+    else:
+        saml_url = build_saml_url(
+            vpn_url, protocol, provider, auth_group, ignore_tls_errors=ignore_tls
+        )
     cookie_names = provider.get("cookies", {}).get(
         protocol, provider.get("cookies", {}).get("anyconnect", [])
     )
+    if anyconnect_auth and anyconnect_auth["token_cookie_name"]:
+        cookie_names = [*cookie_names, anyconnect_auth["token_cookie_name"]]
 
     log(f"Provider: {provider.get('name', provider_name)}")
     log(f"VPN host: {vpn_host} | Protocol: {protocol}")
     log(f"SAML URL: {saml_url}")
+    if anyconnect_auth and anyconnect_auth["token_cookie_name"]:
+        debug(
+            "AnyConnect SSO token cookie: "
+            f"{anyconnect_auth['token_cookie_name']}"
+        )
     log(f"Timeout: {timeout}s")
 
     if ignore_tls:
@@ -346,7 +438,11 @@ def run_auth():
         log("Your credentials will be sent without verifying server certificates.")
         log("Only use this for testing or if you have mounted a custom CA certificate.")
 
-    saml_result = {"saml_response": None, "prelogin_cookie": None}
+    saml_result = {
+        "saml_response": None,
+        "prelogin_cookie": None,
+        "sso_token": None,
+    }
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -404,14 +500,6 @@ def run_auth():
 
         time.sleep(1)
 
-        # Check if already authenticated (cached session)
-        if is_vpn_url(page.url, vpn_host):
-            vpn_cookies = extract_cookies(context, vpn_host, cookie_names)
-            if vpn_cookies or saml_result["saml_response"] or saml_result["prelogin_cookie"]:
-                log("Already authenticated (cached session)")
-                browser.close()
-                return write_result(vpn_cookies, saml_result, vpn_host, protocol, output_file)
-
         # Main auth loop — handle the non-deterministic login flow
         fields = provider.get("fields", {})
         buttons = provider.get("buttons", {})
@@ -421,11 +509,16 @@ def run_auth():
         filled_otp = False
         deadline = time.time() + timeout
         step = 0
+        vpn_cookies = {}
 
         while time.time() < deadline:
-            if saml_result["saml_response"] or saml_result["prelogin_cookie"]:
-                break
-            if is_vpn_url(page.url, vpn_host):
+            vpn_cookies = extract_cookies(context, vpn_host, cookie_names)
+            if anyconnect_auth and anyconnect_auth["token_cookie_name"]:
+                saml_result["sso_token"] = vpn_cookies.get(
+                    anyconnect_auth["token_cookie_name"]
+                )
+
+            if authentication_complete(anyconnect_auth, saml_result, vpn_cookies):
                 break
 
             progressed = False
@@ -535,24 +628,74 @@ def run_auth():
 
         # Collect cookies
         vpn_cookies = extract_cookies(context, vpn_host, cookie_names)
+        if anyconnect_auth and anyconnect_auth["token_cookie_name"]:
+            saml_result["sso_token"] = vpn_cookies.get(
+                anyconnect_auth["token_cookie_name"]
+            )
+        final_page_url = page.url
+        all_vpn_cookie_names = sorted(
+            cookie["name"]
+            for cookie in context.cookies()
+            if cookie_domain_matches(cookie.get("domain", ""), vpn_host)
+        )
         browser.close()
 
-    return write_result(vpn_cookies, saml_result, vpn_host, protocol, output_file)
+    session_token = None
+    server_cert_hash = None
+    if anyconnect_auth and saml_result["sso_token"]:
+        log("Confirming AnyConnect SSO authentication...")
+        session_token, server_cert_hash = confirm_anyconnect_auth(
+            anyconnect_auth,
+            saml_result["sso_token"],
+            ignore_tls_errors=ignore_tls,
+        )
+
+    return write_result(
+        vpn_cookies,
+        saml_result,
+        vpn_host,
+        protocol,
+        output_file,
+        session_token=session_token,
+        server_cert_hash=server_cert_hash,
+        diagnostic_url=final_page_url,
+        diagnostic_cookie_names=all_vpn_cookie_names,
+    )
 
 
-def write_result(vpn_cookies, saml_result, vpn_host, protocol, output_file):
+def write_result(
+    vpn_cookies,
+    saml_result,
+    vpn_host,
+    protocol,
+    output_file,
+    session_token=None,
+    server_cert_hash=None,
+    diagnostic_url=None,
+    diagnostic_cookie_names=None,
+):
     """Build the cookie string and write result JSON."""
     cookie_parts = []
 
-    if saml_result.get("saml_response"):
+    if session_token:
+        cookie_parts.append(session_token)
+    elif saml_result.get("saml_response"):
         cookie_parts.append(f"SAMLResponse={saml_result['saml_response']}")
-    if saml_result.get("prelogin_cookie"):
+    if not session_token and saml_result.get("prelogin_cookie"):
         cookie_parts.append(f"prelogin-cookie={saml_result['prelogin_cookie']}")
-    for name, value in vpn_cookies.items():
-        cookie_parts.append(f"{name}={value}")
+    if not session_token:
+        for name, value in vpn_cookies.items():
+            cookie_parts.append(f"{name}={value}")
 
     if not cookie_parts:
         log("Error: Failed to extract VPN session cookie")
+        if diagnostic_url:
+            log(f"Final browser URL: {diagnostic_url}")
+        if diagnostic_cookie_names:
+            log(
+                "VPN cookies observed: "
+                + ", ".join(diagnostic_cookie_names)
+            )
         log("Tips: set AUTH_DEBUG=1 for screenshots, or try VPN_AUTH_PROVIDER=generic")
         sys.exit(1)
 
@@ -563,6 +706,8 @@ def write_result(vpn_cookies, saml_result, vpn_host, protocol, output_file):
         "timestamp": int(time.time()),
         "protocol": protocol,
     }
+    if server_cert_hash:
+        result["server_cert_hash"] = server_cert_hash
 
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
     with open(output_file, "w") as f:
