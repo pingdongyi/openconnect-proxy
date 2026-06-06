@@ -48,6 +48,7 @@ class BuildSamlUrlTest(unittest.TestCase):
         self.assertEqual(request.full_url, "https://vpn.example.com")
         self.assertEqual(request.get_method(), "GET")
         self.assertEqual(request.headers["Host"], "vpn.example.com")
+        self.assertEqual(request.headers["User-agent"], "AnyConnect")
 
     def test_anyconnect_initializes_auth_with_authgroup(self):
         response_xml = b"""\
@@ -82,6 +83,7 @@ class BuildSamlUrlTest(unittest.TestCase):
         self.assertEqual(
             request.headers["Content-type"], "application/x-www-form-urlencoded"
         )
+        self.assertEqual(request.headers["User-agent"], "AnyConnect")
 
         payload = ET.fromstring(request.data)
         self.assertEqual(payload.attrib["type"], "init")
@@ -186,6 +188,9 @@ class ConfirmAnyconnectAuthTest(unittest.TestCase):
         self.assertEqual(token, "session-token-value")
         self.assertEqual(cert_hash, "sha256:certificate")
         payload = ET.fromstring(opener.open.call_args.args[0].data)
+        self.assertEqual(
+            opener.open.call_args.args[0].headers["User-agent"], "AnyConnect"
+        )
         self.assertEqual(payload.attrib["type"], "auth-reply")
         self.assertEqual(payload.findtext("opaque/tunnel-group"), "employees")
         self.assertEqual(payload.findtext("opaque/aggauth-handle"), "auth-handle")

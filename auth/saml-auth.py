@@ -35,6 +35,7 @@ from playwright.sync_api import sync_playwright
 
 
 ANYCONNECT_VERSION = "4.7.00136"
+ANYCONNECT_USER_AGENT = "AnyConnect"
 
 
 def log(msg):
@@ -112,7 +113,10 @@ def get_actual_url(opener, vpn_url):
     parsed = urllib.parse.urlparse(request_url)
     request = urllib.request.Request(
         request_url,
-        headers={"Host": parsed.netloc},
+        headers={
+            "Host": parsed.netloc,
+            "User-Agent": ANYCONNECT_USER_AGENT,
+        },
         method="GET",
     )
     try:
@@ -131,13 +135,21 @@ def initialize_anyconnect_auth(vpn_url, auth_group=None, ignore_tls_errors=False
     request = urllib.request.Request(
         target_url,
         data=build_anyconnect_init_payload(target_url, auth_group),
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": ANYCONNECT_USER_AGENT,
+        },
         method="POST",
     )
     try:
         with opener.open(request, timeout=60) as response:
             response_root = ET.fromstring(response.read())
     except Exception as exc:
+        if os.environ.get("AUTH_DEBUG") == "1" and hasattr(exc, "read"):
+            try:
+                debug(f"AnyConnect init error response: {exc.read().decode(errors='replace')}")
+            except Exception:
+                pass
         raise RuntimeError(
             f"AnyConnect authentication initialization failed for {target_url}: {exc}"
         ) from exc
@@ -204,7 +216,10 @@ def confirm_anyconnect_auth(auth_init, sso_token, ignore_tls_errors=False):
     request = urllib.request.Request(
         auth_init["target_url"],
         data=build_anyconnect_confirmation_payload(auth_init, sso_token),
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": ANYCONNECT_USER_AGENT,
+        },
         method="POST",
     )
     opener = auth_init.get("opener")
