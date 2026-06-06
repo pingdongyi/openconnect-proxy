@@ -10,6 +10,7 @@ Env vars:
     VPN_PASSWORD        - IdP password (required)
     VPN_TOTP_SECRET     - TOTP secret for MFA auto-fill (optional)
     VPN_PROTOCOL        - anyconnect (default) or globalprotect
+    VPN_AUTHGROUP       - AnyConnect tunnel group / connection profile (optional)
     VPN_AUTH_PROVIDER   - Built-in preset: microsoft, okta, generic (default: microsoft)
     VPN_AUTH_CONFIG     - Path to custom provider YAML (overrides VPN_AUTH_PROVIDER)
     AUTH_OUTPUT_FILE    - Write cookie JSON to this path (default: /auth/cookie.json)
@@ -20,13 +21,19 @@ Env vars:
 import json
 import os
 import re
+import ssl
 import sys
 import time
 import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import yaml
 from playwright.sync_api import sync_playwright
+
+
+ANYCONNECT_VERSION = "4.7.00136"
 
 
 def log(msg):
@@ -60,10 +67,64 @@ def load_provider(provider_name, custom_path=None):
         return yaml.safe_load(f)
 
 
-def build_saml_url(vpn_url, protocol, provider):
+def build_anyconnect_init_payload(vpn_url, auth_group):
+    root = ET.Element(
+        "config-auth",
+        {"client": "vpn", "type": "init", "aggregate-auth-version": "2"},
+    )
+    version = ET.SubElement(root, "version", {"who": "vpn"})
+    version.text = ANYCONNECT_VERSION
+    ET.SubElement(root, "device-id").text = "linux-64"
+    ET.SubElement(root, "group-select").text = auth_group or ""
+    ET.SubElement(root, "group-access").text = vpn_url
+    capabilities = ET.SubElement(root, "capabilities")
+    ET.SubElement(capabilities, "auth-method").text = "single-sign-on-v2"
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+
+def find_xml_text(root, tag_name):
+    for element in root.iter():
+        if element.tag.rsplit("}", 1)[-1] == tag_name and element.text:
+            return element.text.strip()
+    return None
+
+
+def build_saml_url(
+    vpn_url, protocol, provider, auth_group=None, ignore_tls_errors=False
+):
     parsed = urllib.parse.urlparse(
         vpn_url if "://" in vpn_url else f"https://{vpn_url}"
     )
+    target_url = urllib.parse.urlunparse(parsed._replace(fragment=""))
+
+    if protocol == "anyconnect":
+        request = urllib.request.Request(
+            target_url,
+            data=build_anyconnect_init_payload(target_url, auth_group),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )
+        ssl_context = None
+        if ignore_tls_errors:
+            ssl_context = ssl._create_unverified_context()
+
+        try:
+            with urllib.request.urlopen(
+                request, timeout=60, context=ssl_context
+            ) as response:
+                response_root = ET.fromstring(response.read())
+        except Exception as exc:
+            raise RuntimeError(
+                f"AnyConnect authentication initialization failed: {exc}"
+            ) from exc
+
+        sso_login = find_xml_text(response_root, "sso-v2-login")
+        if not sso_login:
+            raise RuntimeError(
+                "AnyConnect authentication response did not contain sso-v2-login"
+            )
+        return urllib.parse.urljoin(target_url, sso_login)
+
     base = f"{parsed.scheme}://{parsed.netloc}"
     saml_paths = provider.get("saml_paths", {})
     path = saml_paths.get(protocol, saml_paths.get("anyconnect", "/"))
@@ -237,12 +298,20 @@ def extract_cookies(context, vpn_host, cookie_names):
     return result
 
 
+def get_auth_timeout(provider):
+    configured_timeout = os.environ.get("AUTH_TIMEOUT")
+    if configured_timeout is None or not configured_timeout.strip():
+        configured_timeout = provider.get("timeout", 90)
+    return int(configured_timeout)
+
+
 def run_auth():
     vpn_url = os.environ.get("VPN_URL")
     vpn_user = os.environ.get("VPN_USER")
     vpn_password = os.environ.get("VPN_PASSWORD")
     totp_secret = os.environ.get("VPN_TOTP_SECRET")
     protocol = os.environ.get("VPN_PROTOCOL", "anyconnect")
+    auth_group = os.environ.get("VPN_AUTHGROUP")
     provider_name = os.environ.get("VPN_AUTH_PROVIDER", "microsoft")
     custom_config = os.environ.get("VPN_AUTH_CONFIG")
     output_file = os.environ.get("AUTH_OUTPUT_FILE", "/auth/cookie.json")
@@ -252,14 +321,17 @@ def run_auth():
         sys.exit(1)
 
     provider = load_provider(provider_name, custom_config)
-    timeout = int(os.environ.get("AUTH_TIMEOUT", provider.get("timeout", 90)))
+    timeout = get_auth_timeout(provider)
 
     parsed = urllib.parse.urlparse(
         vpn_url if "://" in vpn_url else f"https://{vpn_url}"
     )
     vpn_host = parsed.hostname or vpn_url
 
-    saml_url = build_saml_url(vpn_url, protocol, provider)
+    ignore_tls = os.environ.get("AUTH_IGNORE_TLS_ERRORS", "0") == "1"
+    saml_url = build_saml_url(
+        vpn_url, protocol, provider, auth_group, ignore_tls_errors=ignore_tls
+    )
     cookie_names = provider.get("cookies", {}).get(
         protocol, provider.get("cookies", {}).get("anyconnect", [])
     )
@@ -269,7 +341,6 @@ def run_auth():
     log(f"SAML URL: {saml_url}")
     log(f"Timeout: {timeout}s")
 
-    ignore_tls = os.environ.get("AUTH_IGNORE_TLS_ERRORS", "0") == "1"
     if ignore_tls:
         log("WARNING: TLS certificate validation is DISABLED (AUTH_IGNORE_TLS_ERRORS=1)")
         log("Your credentials will be sent without verifying server certificates.")

@@ -7,6 +7,7 @@ services:
       - VPN_PASSWORD=${VPN_PASSWORD}
       - VPN_TOTP_SECRET=${VPN_TOTP_SECRET:-}
       - VPN_PROTOCOL=${VPN_PROTOCOL:-anyconnect}
+      - VPN_AUTHGROUP=${VPN_AUTHGROUP:-}
       - VPN_AUTH_PROVIDER=${VPN_AUTH_PROVIDER:-microsoft}
       - AUTH_OUTPUT_FILE=/auth/cookie.json
       - AUTH_TIMEOUT=${AUTH_TIMEOUT:-}

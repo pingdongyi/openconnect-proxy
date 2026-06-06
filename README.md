@@ -237,6 +237,7 @@ VPN_URL=https://vpn.example.com
 VPN_USER=user@company.com
 VPN_PASSWORD=your-password
 VPN_PROTOCOL=anyconnect
+VPN_AUTHGROUP=your-connection-profile
 VPN_AUTH_PROVIDER=microsoft
 VPN_TOTP_SECRET=YOUR_BASE32_TOTP_SECRET
 ```
@@ -345,6 +346,7 @@ docker run --rm -e AUTH_DEBUG=1 -e VPN_URL=... -v /tmp:/tmp your-auth-image
 | `VPN_USER` | Yes | IdP username |
 | `VPN_PASSWORD` | Yes | IdP password |
 | `VPN_PROTOCOL` | No | `anyconnect` (default) or `globalprotect` |
+| `VPN_AUTHGROUP` | No | AnyConnect tunnel group / connection profile used during SAML initialization |
 | `VPN_AUTH_PROVIDER` | No | Built-in preset: `microsoft` (default), `okta`, `generic` |
 | `VPN_AUTH_CONFIG` | No | Path to custom provider YAML (overrides `VPN_AUTH_PROVIDER`) |
 | `VPN_TOTP_SECRET` | No | TOTP base32 secret for MFA auto-fill |
@@ -429,6 +431,7 @@ Configure these as **masked CI/CD variables** (Settings > CI/CD > Variables):
 | `VPN_PASSWORD` | Yes | VPN / IdP password |
 | `VPN_TOTP_SECRET` | No | TOTP base32 secret — the example maps this to `OPENCONNECT_TOTP_SECRET` (standard) or `VPN_TOTP_SECRET` (SAML) |
 | `VPN_PROTOCOL` | No | `anyconnect` (default) or `globalprotect` |
+| `VPN_AUTHGROUP` | SAML only | AnyConnect tunnel group / connection profile |
 | `VPN_AUTH_PROVIDER` | SAML only | `microsoft` (default), `okta`, or `generic` |
 
 See [`examples/gitlab-ci.saml.yml`](examples/gitlab-ci.saml.yml) for ready-to-use job definitions covering both auth modes.

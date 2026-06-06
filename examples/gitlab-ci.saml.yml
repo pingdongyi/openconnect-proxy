@@ -14,6 +14,7 @@
 #
 # Additional variables for SAML auth:
 #   VPN_PROTOCOL     - anyconnect (default) or globalprotect
+#   VPN_AUTHGROUP    - AnyConnect tunnel group / connection profile (optional)
 #   VPN_AUTH_PROVIDER - microsoft (default), okta, or generic
 
 # --- Standard auth (password + TOTP) ---
@@ -91,6 +92,7 @@ deploy-saml:
       -e VPN_PASSWORD=$VPN_PASSWORD
       -e VPN_TOTP_SECRET=$VPN_TOTP_SECRET
       -e VPN_PROTOCOL=${VPN_PROTOCOL:-anyconnect}
+      -e VPN_AUTHGROUP=${VPN_AUTHGROUP:-}
       -e VPN_AUTH_PROVIDER=${VPN_AUTH_PROVIDER:-microsoft}
       -e AUTH_OUTPUT_FILE=/auth/cookie.json
       -v auth-data:/auth
