@@ -342,7 +342,7 @@ docker run --rm -e AUTH_DEBUG=1 -e VPN_URL=... -v /tmp:/tmp your-auth-image
 
 | Variable | Required | Description |
 |---|---|---|
-| `VPN_URL` | Yes | VPN gateway URL |
+| `VPN_URL` | Yes | VPN gateway URL; redirects are followed before AnyConnect initialization |
 | `VPN_USER` | Yes | IdP username |
 | `VPN_PASSWORD` | Yes | IdP password |
 | `VPN_PROTOCOL` | No | `anyconnect` (default) or `globalprotect` |

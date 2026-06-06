@@ -19,6 +19,7 @@ Env vars:
 """
 
 import json
+import http.cookiejar
 import os
 import re
 import ssl
@@ -89,25 +90,52 @@ def find_xml_text(root, tag_name):
     return None
 
 
-def initialize_anyconnect_auth(vpn_url, auth_group=None, ignore_tls_errors=False):
+def normalize_vpn_url(vpn_url):
     parsed = urllib.parse.urlparse(
         vpn_url if "://" in vpn_url else f"https://{vpn_url}"
     )
-    target_url = urllib.parse.urlunparse(parsed._replace(fragment=""))
+    return urllib.parse.urlunparse(parsed._replace(fragment=""))
+
+
+def create_anyconnect_opener(ignore_tls_errors=False):
+    cookie_jar = http.cookiejar.CookieJar()
+    handlers = [urllib.request.HTTPCookieProcessor(cookie_jar)]
+    if ignore_tls_errors:
+        handlers.append(
+            urllib.request.HTTPSHandler(context=ssl._create_unverified_context())
+        )
+    return urllib.request.build_opener(*handlers)
+
+
+def get_actual_url(opener, vpn_url):
+    request_url = normalize_vpn_url(vpn_url)
+    parsed = urllib.parse.urlparse(request_url)
+    request = urllib.request.Request(
+        request_url,
+        headers={"Host": parsed.netloc},
+        method="GET",
+    )
+    try:
+        with opener.open(request, timeout=60) as response:
+            return response.geturl()
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not resolve AnyConnect gateway URL from {request_url}: {exc}"
+        ) from exc
+
+
+def initialize_anyconnect_auth(vpn_url, auth_group=None, ignore_tls_errors=False):
+    opener = create_anyconnect_opener(ignore_tls_errors)
+    target_url = get_actual_url(opener, vpn_url)
+    debug(f"Resolved AnyConnect gateway URL: {target_url}")
     request = urllib.request.Request(
         target_url,
         data=build_anyconnect_init_payload(target_url, auth_group),
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         method="POST",
     )
-    ssl_context = None
-    if ignore_tls_errors:
-        ssl_context = ssl._create_unverified_context()
-
     try:
-        with urllib.request.urlopen(
-            request, timeout=60, context=ssl_context
-        ) as response:
+        with opener.open(request, timeout=60) as response:
             response_root = ET.fromstring(response.read())
     except Exception as exc:
         raise RuntimeError(
@@ -122,6 +150,7 @@ def initialize_anyconnect_auth(vpn_url, auth_group=None, ignore_tls_errors=False
 
     return {
         "target_url": target_url,
+        "opener": opener,
         "saml_url": urllib.parse.urljoin(target_url, sso_login),
         "tunnel_group": find_xml_text(response_root, "tunnel-group") or "",
         "aggauth_handle": find_xml_text(response_root, "aggauth-handle") or "",
@@ -159,6 +188,8 @@ def build_anyconnect_confirmation_payload(auth_init, sso_token):
     ET.SubElement(root, "device-id").text = "linux-64"
     ET.SubElement(root, "session-token")
     ET.SubElement(root, "session-id")
+    capabilities = ET.SubElement(root, "capabilities")
+    ET.SubElement(capabilities, "auth-method").text = "single-sign-on-v2"
     opaque = ET.SubElement(root, "opaque", {"is-for": "sg"})
     ET.SubElement(opaque, "tunnel-group").text = auth_init["tunnel_group"]
     ET.SubElement(opaque, "aggauth-handle").text = auth_init["aggauth_handle"]
@@ -176,14 +207,12 @@ def confirm_anyconnect_auth(auth_init, sso_token, ignore_tls_errors=False):
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         method="POST",
     )
-    ssl_context = None
-    if ignore_tls_errors:
-        ssl_context = ssl._create_unverified_context()
+    opener = auth_init.get("opener")
+    if opener is None:
+        opener = create_anyconnect_opener(ignore_tls_errors)
 
     try:
-        with urllib.request.urlopen(
-            request, timeout=60, context=ssl_context
-        ) as response:
+        with opener.open(request, timeout=60) as response:
             response_root = ET.fromstring(response.read())
     except Exception as exc:
         raise RuntimeError(

@@ -20,7 +20,35 @@ saml_auth = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(saml_auth)
 
 
+class FakeResponse(io.BytesIO):
+    def __init__(self, body=b"", url="https://vpn.example.com"):
+        super().__init__(body)
+        self.url = url
+
+    def geturl(self):
+        return self.url
+
+
+def fake_opener(*responses):
+    opener = mock.Mock()
+    opener.open.side_effect = responses
+    return opener
+
+
 class BuildSamlUrlTest(unittest.TestCase):
+    def test_get_actual_url_follows_redirects(self):
+        opener = fake_opener(
+            FakeResponse(url="https://vpn.example.com/actual-group")
+        )
+
+        result = saml_auth.get_actual_url(opener, "vpn.example.com")
+
+        self.assertEqual(result, "https://vpn.example.com/actual-group")
+        request = opener.open.call_args.args[0]
+        self.assertEqual(request.full_url, "https://vpn.example.com")
+        self.assertEqual(request.get_method(), "GET")
+        self.assertEqual(request.headers["Host"], "vpn.example.com")
+
     def test_anyconnect_initializes_auth_with_authgroup(self):
         response_xml = b"""\
             <config-auth xmlns="urn:test">
@@ -36,18 +64,20 @@ class BuildSamlUrlTest(unittest.TestCase):
             </config-auth>
         """
 
+        opener = fake_opener(
+            FakeResponse(url="https://vpn.example.com/actual-group"),
+            FakeResponse(response_xml),
+        )
         with mock.patch.object(
-            saml_auth.urllib.request,
-            "urlopen",
-            return_value=io.BytesIO(response_xml),
-        ) as urlopen:
+            saml_auth, "create_anyconnect_opener", return_value=opener
+        ):
             result = saml_auth.build_saml_url(
                 "vpn.example.com", "anyconnect", {}, "employees"
             )
 
         self.assertEqual(result, "https://vpn.example.com/dynamic/saml/login")
-        request = urlopen.call_args.args[0]
-        self.assertEqual(request.full_url, "https://vpn.example.com")
+        request = opener.open.call_args_list[1].args[0]
+        self.assertEqual(request.full_url, "https://vpn.example.com/actual-group")
         self.assertEqual(request.get_method(), "POST")
         self.assertEqual(
             request.headers["Content-type"], "application/x-www-form-urlencoded"
@@ -56,7 +86,10 @@ class BuildSamlUrlTest(unittest.TestCase):
         payload = ET.fromstring(request.data)
         self.assertEqual(payload.attrib["type"], "init")
         self.assertEqual(payload.findtext("group-select"), "employees")
-        self.assertEqual(payload.findtext("group-access"), "https://vpn.example.com")
+        self.assertEqual(
+            payload.findtext("group-access"),
+            "https://vpn.example.com/actual-group",
+        )
         self.assertEqual(
             payload.findtext("capabilities/auth-method"), "single-sign-on-v2"
         )
@@ -76,10 +109,9 @@ class BuildSamlUrlTest(unittest.TestCase):
             </config-auth>
         """
 
+        opener = fake_opener(FakeResponse(), FakeResponse(response_xml))
         with mock.patch.object(
-            saml_auth.urllib.request,
-            "urlopen",
-            return_value=io.BytesIO(response_xml),
+            saml_auth, "create_anyconnect_opener", return_value=opener
         ):
             result = saml_auth.initialize_anyconnect_auth(
                 "https://vpn.example.com", "employees"
@@ -90,12 +122,15 @@ class BuildSamlUrlTest(unittest.TestCase):
         self.assertEqual(result["aggauth_handle"], "auth-handle")
         self.assertEqual(result["config_hash"], "config-hash")
         self.assertEqual(result["token_cookie_name"], "acSamlv2Token")
+        self.assertIs(result["opener"], opener)
 
     def test_anyconnect_requires_sso_login_in_response(self):
+        opener = fake_opener(
+            FakeResponse(),
+            FakeResponse(b"<config-auth><auth /></config-auth>"),
+        )
         with mock.patch.object(
-            saml_auth.urllib.request,
-            "urlopen",
-            return_value=io.BytesIO(b"<config-auth><auth /></config-auth>"),
+            saml_auth, "create_anyconnect_opener", return_value=opener
         ):
             with self.assertRaisesRegex(RuntimeError, "sso-v2-login"):
                 saml_auth.build_saml_url(
@@ -103,30 +138,19 @@ class BuildSamlUrlTest(unittest.TestCase):
                 )
 
     def test_anyconnect_can_disable_tls_validation(self):
-        response_xml = (
-            b"<config-auth><auth><sso-v2-login>https://idp.example.com/login"
-            b"</sso-v2-login></auth></config-auth>"
-        )
         ssl_context = object()
 
         with mock.patch.object(
             saml_auth.ssl,
             "_create_unverified_context",
             return_value=ssl_context,
-        ), mock.patch.object(
-            saml_auth.urllib.request,
-            "urlopen",
-            return_value=io.BytesIO(response_xml),
-        ) as urlopen:
-            result = saml_auth.build_saml_url(
-                "https://vpn.example.com",
-                "anyconnect",
-                {},
-                ignore_tls_errors=True,
-            )
+        ) as create_context, mock.patch.object(
+            saml_auth.urllib.request, "build_opener"
+        ) as build_opener:
+            saml_auth.create_anyconnect_opener(ignore_tls_errors=True)
 
-        self.assertEqual(result, "https://idp.example.com/login")
-        self.assertIs(urlopen.call_args.kwargs["context"], ssl_context)
+        create_context.assert_called_once_with()
+        self.assertEqual(len(build_opener.call_args.args), 2)
 
     def test_other_protocol_uses_provider_path(self):
         provider = {"saml_paths": {"globalprotect": "/global/prelogin"}}
@@ -153,22 +177,22 @@ class ConfirmAnyconnectAuthTest(unittest.TestCase):
             </config-auth>
         """
 
-        with mock.patch.object(
-            saml_auth.urllib.request,
-            "urlopen",
-            return_value=io.BytesIO(response_xml),
-        ) as urlopen:
-            token, cert_hash = saml_auth.confirm_anyconnect_auth(
-                auth_init, "sso-token-value"
-            )
+        opener = fake_opener(FakeResponse(response_xml))
+        auth_init["opener"] = opener
+        token, cert_hash = saml_auth.confirm_anyconnect_auth(
+            auth_init, "sso-token-value"
+        )
 
         self.assertEqual(token, "session-token-value")
         self.assertEqual(cert_hash, "sha256:certificate")
-        payload = ET.fromstring(urlopen.call_args.args[0].data)
+        payload = ET.fromstring(opener.open.call_args.args[0].data)
         self.assertEqual(payload.attrib["type"], "auth-reply")
         self.assertEqual(payload.findtext("opaque/tunnel-group"), "employees")
         self.assertEqual(payload.findtext("opaque/aggauth-handle"), "auth-handle")
         self.assertEqual(payload.findtext("opaque/config-hash"), "config-hash")
+        self.assertEqual(
+            payload.findtext("capabilities/auth-method"), "single-sign-on-v2"
+        )
         self.assertEqual(payload.findtext("auth/sso-token"), "sso-token-value")
 
 
